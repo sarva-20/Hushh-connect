@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
+from sklearn.metrics.pairwise import cosine_similarity
+
 from .vector_store import (
     cosine_sim,
-    get_gig_description_vector,
-    get_gig_skill_vector,
     get_user_description_vector,
     get_user_skill_vector,
+    get_gig_description_vector,
+    get_gig_skill_vector,
+    get_gig_skill_matrix,
+    get_gig_id_order,
+    get_user_skill_matrix,
+    get_user_id_order,
     is_vector_store_ready,
 )
 
@@ -39,13 +45,13 @@ def _normalize_score(value: float) -> float:
 
 
 # -------------------------------------------------
-# SUGGESTION ENGINE (User → Gigs)
+# FAST SUGGESTION ENGINE (User → Top 50 Gigs)
 # -------------------------------------------------
 
 def suggest_gigs_for_user(
     user: dict,
     gigs: List[dict],
-    all_users: List[dict],
+    top_k: int = 50,
 ) -> List[dict]:
 
     if not is_vector_store_ready():
@@ -61,31 +67,59 @@ def suggest_gigs_for_user(
     if user_desc_vec is None or user_skill_vec is None:
         return []
 
+    gig_skill_matrix = get_gig_skill_matrix()
+    gig_id_order = get_gig_id_order()
+
+    if gig_skill_matrix is None or not gig_id_order:
+        return []
+
+    # Build fast gig lookup map (O(n) once)
+    gig_map = {str(g.get("id")): g for g in gigs}
+
+    # -----------------------------------------
+    # 1. Matrix-level similarity (single call)
+    # -----------------------------------------
+
+    skill_similarities = cosine_similarity(
+        user_skill_vec,
+        gig_skill_matrix,
+    )[0]
+
+    # -----------------------------------------
+    # 2. Get top_k indices
+    # -----------------------------------------
+
+    sorted_indices = skill_similarities.argsort()[::-1]
+    top_indices = sorted_indices[:top_k]
+
     suggestions: List[dict] = []
 
-    for gig in gigs:
-        gig_id = str(gig.get("id", "")).strip()
-        if not gig_id:
+    # -----------------------------------------
+    # 3. Score only top_k gigs
+    # -----------------------------------------
+
+    for idx in top_indices:
+        gig_id = gig_id_order[idx]
+        gig = gig_map.get(gig_id)
+
+        if not gig:
             continue
 
         gig_desc_vec = get_gig_description_vector(gig_id)
-        gig_skill_vec = get_gig_skill_vector(gig_id)
 
-        if gig_desc_vec is None or gig_skill_vec is None:
-            continue
+        skill_similarity = float(skill_similarities[idx])
 
-        # --- Core Similarities ---
-        skill_similarity = cosine_sim(gig_skill_vec, user_skill_vec)
-        description_similarity = cosine_sim(gig_desc_vec, user_desc_vec)
+        description_similarity = cosine_sim(
+            gig_desc_vec,
+            user_desc_vec,
+        )
 
-        # --- Urgency & Freshness ---
         deadline_hours = _to_int(gig.get("deadline_hours"), 0)
         hours_since_posted = _to_float(gig.get("hours_since_posted"), 0.0)
 
         urgency = 1.0 if deadline_hours < 48 else 0.0
         freshness = max(1.0 - (hours_since_posted / 72.0), 0.0)
 
-        # --- Suggestion Score ---
         score = (
             0.45 * skill_similarity
             + 0.35 * description_similarity
@@ -95,39 +129,31 @@ def suggest_gigs_for_user(
 
         score = _normalize_score(score)
 
-        # --- Inline Collaboration Suggestion ---
-        collaboration = None
-        if skill_similarity < 0.35:
-            collaboration = detect_collaboration_for_gig(
-                gig,
-                user,
-                all_users,
-            )
-
         suggestions.append(
             {
                 "gig_id": gig_id,
                 "score": float(score),
-                "skill_similarity": float(skill_similarity),
+                "skill_similarity": skill_similarity,
                 "description_similarity": float(description_similarity),
-                "urgency": float(urgency),
-                "freshness": float(freshness),
-                "collaboration": collaboration,
+                "urgency": urgency,
+                "freshness": freshness,
             }
         )
 
     suggestions.sort(key=lambda item: item["score"], reverse=True)
+
     return suggestions
 
 
 # -------------------------------------------------
-# COLLABORATION DETECTION (Top 2)
+# ON-DEMAND COLLABORATION ENGINE
+# (Call only when user opens gig detail)
 # -------------------------------------------------
 
 def detect_collaboration_for_gig(
     gig: dict,
     user: dict,
-    all_users: List[dict],
+    top_user_limit: int = 100,
 ) -> Optional[List[dict]]:
 
     if not is_vector_store_ready():
@@ -147,24 +173,40 @@ def detect_collaboration_for_gig(
 
     base_similarity = cosine_sim(gig_skill_vec, user_skill_vec)
 
-    # If user already sufficiently matched, no collaboration needed
+    # If already strong match → no collaboration needed
     if base_similarity >= 0.35:
         return None
 
+    user_skill_matrix = get_user_skill_matrix()
+    user_id_order = get_user_id_order()
+
+    if user_skill_matrix is None:
+        return None
+
+    # Single matrix similarity call
+    similarities = cosine_similarity(
+        gig_skill_vec,
+        user_skill_matrix,
+    )[0]
+
+    # Top N candidate users
+    sorted_indices = similarities.argsort()[::-1][:top_user_limit]
+
     collaboration_candidates = []
 
-    for other in all_users:
-        other_id = str(other.get("id", "")).strip()
-        if not other_id or other_id == user_id:
+    for idx in sorted_indices:
+        other_id = user_id_order[idx]
+
+        if other_id == user_id:
             continue
 
-        other_skill_vec = get_user_skill_vector(other_id)
-        if other_skill_vec is None:
-            continue
+        other_skill_vec = user_skill_matrix[idx]
 
-        # Sparse vector addition (efficient)
         combined_vector = user_skill_vec + other_skill_vec
-        combined_similarity = cosine_sim(gig_skill_vec, combined_vector)
+        combined_similarity = cosine_sim(
+            gig_skill_vec,
+            combined_vector,
+        )
 
         if combined_similarity > 0.5:
             collaboration_candidates.append(

@@ -6,3 +6,7 @@ pydantic[email]
 httpx
 python-dotenv
 pydantic-settings
+openai
+scikit-learn
+scipy
+numpy
