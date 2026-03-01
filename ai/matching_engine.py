@@ -12,6 +12,10 @@ from .vector_store import (
 )
 
 
+# -------------------------------------------------
+# Utility Helpers
+# -------------------------------------------------
+
 def _to_float(value: object, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -26,117 +30,156 @@ def _to_int(value: object, default: int = 0) -> int:
         return default
 
 
-def _normalize_score(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
-    if value < min_value:
-        return min_value
-    if value > max_value:
-        return max_value
+def _normalize_score(value: float) -> float:
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
     return value
 
 
-def _resolve_gig_owner_id(gig: Dict[str, object]) -> Optional[str]:
-    for key in ("owner_id", "user_id", "created_by"):
-        owner_id = gig.get(key)
-        if owner_id is not None:
-            owner_text = str(owner_id).strip()
-            if owner_text:
-                return owner_text
-    return None
+# -------------------------------------------------
+# SUGGESTION ENGINE (User → Gigs)
+# -------------------------------------------------
 
-
-def calculate_match_score(
-    gig: dict,
+def suggest_gigs_for_user(
     user: dict,
-    gig_desc_vec,
-    gig_skill_vec,
-) -> dict:
-
-    user_id = str(user.get("id", "")).strip()
-
-    description_similarity = cosine_sim(
-        gig_desc_vec,
-        get_user_description_vector(user_id),
-    )
-
-    skill_similarity = cosine_sim(
-        gig_skill_vec,
-        get_user_skill_vector(user_id),
-    )
-
-    # Optional relevance filter
-    if skill_similarity < 0.05:
-        return {"score": 0.0, "breakdown": {}}
-
-    rating = _to_float(user.get("rating"), 0.0)
-    readiness = _to_float(user.get("job_readiness_score"), 0.0)
-    recent_gigs = _to_int(user.get("recent_gigs_30d"), 0)
-    deadline_hours = _to_int(gig.get("deadline_hours"), 0)
-
-    rating_normalized = _normalize_score(rating / 5.0)
-    readiness_normalized = _normalize_score(readiness / 100.0)
-    activity_score = _normalize_score(recent_gigs / 5.0)
-
-    match_score = (
-        0.35 * skill_similarity
-        + 0.30 * description_similarity
-        + 0.20 * rating_normalized
-        + 0.10 * readiness_normalized
-        + 0.05 * activity_score
-    )
-
-    if deadline_hours < 48:
-        match_score += rating_normalized * 0.05
-
-    match_score = _normalize_score(match_score)
-
-    return {
-        "score": float(match_score),
-        "breakdown": {
-            "skill_similarity": float(skill_similarity),
-            "description_similarity": float(description_similarity),
-            "rating": float(rating_normalized),
-            "job_readiness": float(readiness_normalized),
-            "activity": float(activity_score),
-        },
-    }
-
-
-def rank_providers(gig: dict, users: List[dict]) -> List[dict]:
+    gigs: List[dict],
+    all_users: List[dict],
+) -> List[dict]:
 
     if not is_vector_store_ready():
         return []
 
-    gig_id = str(gig.get("id", "")).strip()
-    owner_id = _resolve_gig_owner_id(gig)
+    user_id = str(user.get("id", "")).strip()
+    if not user_id:
+        return []
 
-    gig_desc_vec = get_gig_description_vector(gig_id)
-    gig_skill_vec = get_gig_skill_vector(gig_id)
+    user_desc_vec = get_user_description_vector(user_id)
+    user_skill_vec = get_user_skill_vector(user_id)
 
-    ranked: List[dict] = []
+    if user_desc_vec is None or user_skill_vec is None:
+        return []
 
-    for user in users:
-        user_id = str(user.get("id", "")).strip()
-        if not user_id:
+    suggestions: List[dict] = []
+
+    for gig in gigs:
+        gig_id = str(gig.get("id", "")).strip()
+        if not gig_id:
             continue
 
-        if owner_id is not None and user_id == owner_id:
+        gig_desc_vec = get_gig_description_vector(gig_id)
+        gig_skill_vec = get_gig_skill_vector(gig_id)
+
+        if gig_desc_vec is None or gig_skill_vec is None:
             continue
 
-        score_data = calculate_match_score(
-            gig,
-            user,
-            gig_desc_vec,
-            gig_skill_vec,
+        # --- Core Similarities ---
+        skill_similarity = cosine_sim(gig_skill_vec, user_skill_vec)
+        description_similarity = cosine_sim(gig_desc_vec, user_desc_vec)
+
+        # --- Urgency & Freshness ---
+        deadline_hours = _to_int(gig.get("deadline_hours"), 0)
+        hours_since_posted = _to_float(gig.get("hours_since_posted"), 0.0)
+
+        urgency = 1.0 if deadline_hours < 48 else 0.0
+        freshness = max(1.0 - (hours_since_posted / 72.0), 0.0)
+
+        # --- Suggestion Score ---
+        score = (
+            0.45 * skill_similarity
+            + 0.35 * description_similarity
+            + 0.10 * urgency
+            + 0.10 * freshness
         )
 
-        if score_data["score"] > 0:
-            ranked.append(
+        score = _normalize_score(score)
+
+        # --- Inline Collaboration Suggestion ---
+        collaboration = None
+        if skill_similarity < 0.35:
+            collaboration = detect_collaboration_for_gig(
+                gig,
+                user,
+                all_users,
+            )
+
+        suggestions.append(
+            {
+                "gig_id": gig_id,
+                "score": float(score),
+                "skill_similarity": float(skill_similarity),
+                "description_similarity": float(description_similarity),
+                "urgency": float(urgency),
+                "freshness": float(freshness),
+                "collaboration": collaboration,
+            }
+        )
+
+    suggestions.sort(key=lambda item: item["score"], reverse=True)
+    return suggestions
+
+
+# -------------------------------------------------
+# COLLABORATION DETECTION (Top 2)
+# -------------------------------------------------
+
+def detect_collaboration_for_gig(
+    gig: dict,
+    user: dict,
+    all_users: List[dict],
+) -> Optional[List[dict]]:
+
+    if not is_vector_store_ready():
+        return None
+
+    gig_id = str(gig.get("id", "")).strip()
+    user_id = str(user.get("id", "")).strip()
+
+    if not gig_id or not user_id:
+        return None
+
+    gig_skill_vec = get_gig_skill_vector(gig_id)
+    user_skill_vec = get_user_skill_vector(user_id)
+
+    if gig_skill_vec is None or user_skill_vec is None:
+        return None
+
+    base_similarity = cosine_sim(gig_skill_vec, user_skill_vec)
+
+    # If user already sufficiently matched, no collaboration needed
+    if base_similarity >= 0.35:
+        return None
+
+    collaboration_candidates = []
+
+    for other in all_users:
+        other_id = str(other.get("id", "")).strip()
+        if not other_id or other_id == user_id:
+            continue
+
+        other_skill_vec = get_user_skill_vector(other_id)
+        if other_skill_vec is None:
+            continue
+
+        # Sparse vector addition (efficient)
+        combined_vector = user_skill_vec + other_skill_vec
+        combined_similarity = cosine_sim(gig_skill_vec, combined_vector)
+
+        if combined_similarity > 0.5:
+            collaboration_candidates.append(
                 {
-                    "user_id": user_id,
-                    "score": score_data["score"],
-                    "breakdown": score_data["breakdown"],
+                    "collaborate_with": other_id,
+                    "combined_similarity": float(combined_similarity),
                 }
             )
 
-    ranked.sort(key=lambda item: item["score"], reverse=True)
-    return ranked[:3]
+    if not collaboration_candidates:
+        return None
+
+    collaboration_candidates.sort(
+        key=lambda x: x["combined_similarity"],
+        reverse=True,
+    )
+
+    return collaboration_candidates[:2]
