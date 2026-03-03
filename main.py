@@ -7,6 +7,9 @@ from routers.user_routes import router as user_router
 
 from services.db_service import get_all_users, get_all_gigs
 from ai.vector_store import rebuild_vector_store
+from routers.leaderboard_routes import router as leaderboard_router
+
+from fastapi.middleware.cors import CORSMiddleware
 
 
 app = FastAPI(
@@ -27,7 +30,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # ---------------------------------------------------
 # Include Routers
 # ---------------------------------------------------
@@ -35,8 +37,7 @@ app.add_middleware(
 app.include_router(ai_router)
 app.include_router(gig_router)
 app.include_router(user_router)
-
-
+app.include_router(leaderboard_router)
 # ---------------------------------------------------
 # Health Check
 # ---------------------------------------------------
@@ -64,3 +65,4 @@ def startup_vector_rebuild():
 
     except Exception as e:
         print(f"Startup rebuild failed: {e}")
+
