@@ -165,3 +165,41 @@ Skills: {", ".join(skills)}
                 }
             ]
         }
+
+
+def enhance_description(description: str) -> str:
+
+    prompt = f"""
+Rewrite the following student profile description into ONE professional, confident paragraph.
+
+Rules:
+- Return ONLY the improved description.
+- Do NOT provide alternatives.
+- Do NOT explain anything.
+- Do NOT include bullet points.
+- Keep it concise (3–4 sentences max).
+- Make it strong, confident, and skill-focused.
+
+Description:
+{description}
+"""
+
+    response = _call_llm(
+        [
+            {"role": "system", "content": "You are a professional profile writing assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.6,
+    )
+
+    # Safety cleanup
+    cleaned = response.strip()
+
+    # Remove common unwanted patterns
+    if "Alternatively" in cleaned:
+        cleaned = cleaned.split("Alternatively")[0]
+
+    if "This revised description" in cleaned:
+        cleaned = cleaned.split("This revised description")[0]
+
+    return cleaned.strip()

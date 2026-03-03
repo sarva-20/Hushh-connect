@@ -12,7 +12,6 @@ db = get_database()
 def serialize_doc(doc):
     if not doc:
         return None
-
     doc["_id"] = str(doc["_id"])
     return doc
 
@@ -24,6 +23,16 @@ def serialize_doc(doc):
 def create_user(user_data: dict):
     user_data["created_at"] = datetime.utcnow()
     user_data["updated_at"] = datetime.utcnow()
+
+    # ✅ NEW FIELDS (lossless addition)
+    user_data.setdefault("wallet_balance", 1000)   # starter credits
+    user_data.setdefault("role", "student")        # student / alumni / external
+    user_data.setdefault("total_xp", 0)
+    user_data.setdefault("total_gigs_posted", 0)
+    user_data.setdefault("total_gigs_completed", 0)
+    user_data.setdefault("rating", 0)
+    user_data.setdefault("rating_count", 0)
+    user_data.setdefault("unique_skills_used", 0)
 
     result = db.users.insert_one(user_data)
     inserted = db.users.find_one({"_id": result.inserted_id})
@@ -91,6 +100,10 @@ def save_gig_to_db(gig_data: dict):
     gig_data["gig_id"] = f"gig_{ObjectId()}"
     gig_data["created_at"] = datetime.utcnow()
     gig_data["status"] = "open"
+
+    # ✅ Escrow fields preserved if passed
+    gig_data.setdefault("escrow_amount", gig_data.get("price", 0))
+    gig_data.setdefault("escrow_locked", False)
 
     result = db.gigs.insert_one(gig_data)
     inserted = db.gigs.find_one({"_id": result.inserted_id})
@@ -178,6 +191,7 @@ def create_proof_of_work(data: dict):
 def get_proof_by_gig(gig_id: str):
     proof = db.proof_of_work.find_one({"gig_id": gig_id})
     return serialize_doc(proof)
+
 
 # =====================================================
 # RATING + READINESS
